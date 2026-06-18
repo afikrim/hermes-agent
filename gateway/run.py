@@ -3918,6 +3918,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not adapter:
                 return True
 
+            # Respect notice_delivery for draining messages too
+            _cfg_drain = getattr(self, 'config', None)
+            if _cfg_drain and hasattr(_cfg_drain, 'get_notice_delivery'):
+                if _cfg_drain.get_notice_delivery(event.source.platform) == 'none':
+                    return True
+
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled():
@@ -4029,6 +4035,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not busy_ack_enabled:
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
+
+        # Also respect notice_delivery config — platforms with
+        # notice_delivery=none suppress busy ack messages too.
+        _cfg_busy = getattr(self, 'config', None)
+        if _cfg_busy and hasattr(_cfg_busy, 'get_notice_delivery'):
+            if _cfg_busy.get_notice_delivery(event.source.platform) == 'none':
+                logger.debug("Busy ack suppressed via notice_delivery for session %s", session_key)
+                return True
 
         # Debounce: only send an acknowledgment once every 30 seconds per session
         # to avoid spamming the user when they send multiple messages quickly
@@ -8110,17 +8124,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _echo_adapter = self.adapters.get(source.platform)
                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
-                        for _tx in _successful_transcripts:
-                            try:
-                                await _echo_adapter.send(
-                                    source.chat_id,
-                                    f'🎙️ "{_tx}"',
-                                    metadata=_echo_meta,
-                                )
-                            except Exception as _echo_exc:
-                                logger.debug(
-                                    "Transcript echo failed (non-fatal): %s", _echo_exc,
-                                )
+                        # Respect notice_delivery for transcript echo
+                        _cfg_echo = getattr(self, 'config', None)
+                        if not (_cfg_echo and hasattr(_cfg_echo, 'get_notice_delivery')
+                                and _cfg_echo.get_notice_delivery(source.platform) == 'none'):
+                            for _tx in _successful_transcripts:
+                                try:
+                                    await _echo_adapter.send(
+                                        source.chat_id,
+                                        f'🎙️ "{_tx}"',
+                                        metadata=_echo_meta,
+                                    )
+                                except Exception as _echo_exc:
+                                    logger.debug(
+                                        "Transcript echo failed (non-fatal): %s", _echo_exc,
+                                    )
                 _stt_fail_markers = (
                     "No STT provider",
                     "STT is disabled",
@@ -8131,25 +8149,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _stt_adapter = self.adapters.get(source.platform)
                     _stt_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _stt_adapter:
-                        try:
-                            _stt_msg = (
-                                "🎤 I received your voice message but can't transcribe it — "
-                                "no speech-to-text provider is configured.\n\n"
-                                "To enable voice: install faster-whisper "
-                                "(`uv pip install faster-whisper` in the Hermes venv; "
-                                "`pip install faster-whisper` also works if pip is on PATH) "
-                                "and set `stt.enabled: true` in config.yaml, "
-                                "then /restart the gateway."
-                            )
-                            if self._has_setup_skill():
-                                _stt_msg += "\n\nFor full setup instructions, type: `/skill hermes-agent-setup`"
-                            await _stt_adapter.send(
-                                source.chat_id,
-                                _stt_msg,
-                                metadata=_stt_meta,
-                            )
-                        except Exception:
-                            pass
+                        # Respect notice_delivery for STT failure messages
+                        _cfg_stt = getattr(self, 'config', None)
+                        if not (_cfg_stt and hasattr(_cfg_stt, 'get_notice_delivery')
+                                and _cfg_stt.get_notice_delivery(source.platform) == 'none'):
+                            try:
+                                _stt_msg = (
+                                    "🎤 I received your voice message but can't transcribe it — "
+                                    "no speech-to-text provider is configured.\n\n"
+                                    "To enable voice: install faster-whisper "
+                                    "(`uv pip install faster-whisper` in the Hermes venv; "
+                                    "`pip install faster-whisper` also works if pip is on PATH) "
+                                    "and set `stt.enabled: true` in config.yaml, "
+                                    "then /restart the gateway."
+                                )
+                                if self._has_setup_skill():
+                                    _stt_msg += "\n\nFor full setup instructions, type: `/skill hermes-agent-setup`"
+                                await _stt_adapter.send(
+                                    source.chat_id,
+                                    _stt_msg,
+                                    metadata=_stt_meta,
+                                )
+                            except Exception:
+                                pass
 
         if audio_file_paths:
             from tools.credential_files import to_agent_visible_cache_path as _to_agent_path
@@ -8473,12 +8495,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 platform_name = source.platform.value if source.platform else ""
                 had_activity = getattr(session_entry, 'reset_had_activity', False)
-                # Suspended sessions always notify (they were explicitly stopped
-                # or crashed mid-operation) — skip the policy check.
-                should_notify = reset_reason == "suspended" or (
-                    policy.notify
-                    and had_activity
+                # Suspended sessions notify by default but respect
+                # notify_exclude_platforms for platforms that opt out.
+                # Also respect notice_delivery config — platforms with
+                # notice_delivery=none suppress session reset notifications too.
+                _config = getattr(self, 'config', None)
+                _notice_delivery = 'none' if (
+                    _config and hasattr(_config, 'get_notice_delivery')
+                    and _config.get_notice_delivery(source.platform) == 'none'
+                ) else 'public'
+                should_notify = (
+                    (reset_reason == 'suspended' or (policy.notify and had_activity))
                     and platform_name not in policy.notify_exclude_platforms
+                    and _notice_delivery != 'none'
                 )
                 if should_notify:
                     adapter = self.adapters.get(source.platform)
@@ -14898,6 +14927,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _deliver_bg_review_message(message: str) -> None:
                 if not _status_adapter or not _run_still_current():
                     return
+                # Respect notice_delivery config
+                _cfg_notice = getattr(self, 'config', None)
+                if _cfg_notice and hasattr(_cfg_notice, 'get_notice_delivery'):
+                    if _cfg_notice.get_notice_delivery(source.platform) == 'none':
+                        return
                 safe_schedule_threadsafe(
                     _status_adapter.send(
                         _status_chat_id,

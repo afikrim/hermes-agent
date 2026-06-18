@@ -300,6 +300,11 @@ class GatewayKanbanWatchersMixin:
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
+                            # Respect notice_delivery for kanban notifications
+                            _cfg_kanban = getattr(self, 'config', None)
+                            if _cfg_kanban and hasattr(_cfg_kanban, 'get_notice_delivery'):
+                                if _cfg_kanban.get_notice_delivery(plat) == 'none':
+                                    continue
                             await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
                             )
