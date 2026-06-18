@@ -105,7 +105,7 @@ def _normalize_notice_delivery(value: Any, default: str = "public") -> str:
     """Normalize notice delivery mode to a supported value."""
     if isinstance(value, str):
         normalized = value.strip().lower()
-        if normalized in {"public", "private"}:
+        if normalized in {"public", "private", "none"}:
             return normalized
     return default
 
