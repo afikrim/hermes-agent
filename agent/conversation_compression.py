@@ -90,6 +90,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
     try:
         from agent.auxiliary_client import (
             _resolve_task_provider_model,
+            _try_configured_fallback_for_unavailable_client,
             get_text_auxiliary_client,
         )
         from agent.model_metadata import (
@@ -97,10 +98,6 @@ def check_compression_model_feasibility(agent: Any) -> None:
             get_model_context_length,
         )
 
-        client, aux_model = get_text_auxiliary_client(
-            "compression",
-            main_runtime=agent._current_main_runtime(),
-        )
         # Best-effort aux provider label for the warning message. The
         # configured provider may be "auto", in which case we fall back
         # to the client's base_url hostname so the user can still tell
@@ -109,6 +106,19 @@ def check_compression_model_feasibility(agent: Any) -> None:
             _aux_cfg_provider, _, _, _, _ = _resolve_task_provider_model("compression")
         except Exception:
             _aux_cfg_provider = ""
+        client, aux_model = get_text_auxiliary_client(
+            "compression",
+            main_runtime=agent._current_main_runtime(),
+        )
+        if client is None or not aux_model:
+            fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
+                "compression",
+                _aux_cfg_provider,
+            )
+            if fb_client is not None and fb_model:
+                client, aux_model = fb_client, fb_model
+                if "(" in fb_label and fb_label.endswith(")"):
+                    _aux_cfg_provider = fb_label.rsplit("(", 1)[1][:-1]
         if client is None or not aux_model:
             if _aux_cfg_provider and _aux_cfg_provider != "auto":
                 msg = (
@@ -276,6 +286,29 @@ def replay_compression_warning(agent: Any) -> None:
             agent.status_callback("lifecycle", msg)
         except Exception:
             pass
+
+
+def conversation_history_after_compression(agent: Any, messages: list) -> Optional[list]:
+    """Return the correct flush baseline after a compression boundary.
+
+    Legacy compression rotates to a fresh child session. That child has not
+    seen the compacted transcript through the normal same-turn flush path yet,
+    so callers must clear ``conversation_history`` to ``None`` and let the next
+    persistence call write the whole compacted list.
+
+    In-place compaction is different: ``archive_and_compact()`` has already
+    soft-archived the previous active rows and inserted ``messages`` as the new
+    active live transcript under the same session id. If the same agent turn
+    continues with ``conversation_history=None``, the identity-based flush path
+    treats those already-persisted compacted dicts as new and appends them a
+    second time, doubling the active context and retriggering compression.
+
+    A shallow copy is intentional: it captures the current compacted dict
+    identities as history while allowing later same-turn appends to remain new.
+    """
+    if bool(getattr(agent, "_last_compaction_in_place", False)):
+        return list(messages)
+    return None
 
 
 def compress_context(
@@ -592,14 +625,62 @@ def compress_context(
                 except Exception:
                     pass
                 agent._session_db_created = False
-                agent._session_db.create_session(
-                    session_id=agent.session_id,
-                    source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                    model=agent.model,
-                    model_config=agent._session_init_model_config,
-                    parent_session_id=old_session_id,
-                )
+                try:
+                    agent._session_db.create_session(
+                        session_id=agent.session_id,
+                        source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                        model=agent.model,
+                        model_config=agent._session_init_model_config,
+                        parent_session_id=old_session_id,
+                    )
+                except Exception as _cs_err:
+                    # The child row could not be created (e.g. FK constraint,
+                    # contended write). Previously the outer handler simply
+                    # warned and let the agent continue on the NEW id — which
+                    # has no row in state.db, producing an orphan: the parent
+                    # is ended, the child is never indexed, and every
+                    # subsequent message is attributed to a session that
+                    # doesn't exist (#33906/#33907). Roll the live id back to
+                    # the parent so the conversation stays attached to a real,
+                    # indexed session instead of a phantom.
+                    logger.warning(
+                        "Compression child session create failed (%s) — "
+                        "rolling back to parent session %s to avoid an orphan.",
+                        _cs_err, old_session_id,
+                    )
+                    agent.session_id = old_session_id
+                    try:
+                        from gateway.session_context import set_current_session_id
+                        set_current_session_id(agent.session_id)
+                    except Exception:
+                        os.environ["HERMES_SESSION_ID"] = agent.session_id
+                    try:
+                        from hermes_logging import set_session_context
+                        set_session_context(agent.session_id)
+                    except Exception:
+                        pass
+                    # Re-open the parent: it was ended above, but we're
+                    # continuing on it, so it must not stay closed.
+                    try:
+                        agent._session_db.reopen_session(old_session_id)
+                    except Exception:
+                        pass
+                    old_session_id = None  # no rotation happened
+                    # The parent row already exists in state.db, so mark the
+                    # session as created — _ensure_db_session would otherwise
+                    # retry a (harmless INSERT OR IGNORE) create next turn.
+                    agent._session_db_created = True
+                    raise
                 agent._session_db_created = True
+                # Carry a persistent /goal onto the continuation session.
+                # Compression mints a fresh child id; load_goal does a flat
+                # per-session lookup with no parent walk, so without this an
+                # active goal silently dies at the boundary (#33618).
+                try:
+                    from hermes_cli.goals import migrate_goal_to_session
+                    migrate_goal_to_session(old_session_id, agent.session_id, reason="compression")
+                except Exception as _goal_err:
+                    logger.debug("Could not migrate goal on compression: %s", _goal_err)
                 # Auto-number the title for the continuation session
                 if old_title:
                     try:
@@ -615,7 +696,18 @@ def compress_context(
             agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
             agent._last_flushed_db_idx = 0
         except Exception as e:
-            logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+            # If the rotation rolled back to the parent (orphan-avoidance
+            # above), agent.session_id is the still-indexed parent and
+            # old_session_id was cleared — so this is recovery, not an
+            # un-indexed orphan. Otherwise an earlier step failed before the
+            # child was created and the warning's original meaning holds.
+            if locals().get("old_session_id") is None and not in_place:
+                logger.warning(
+                    "Compression rotation aborted and rolled back to the "
+                    "parent session (%s): %s", agent.session_id or "?", e,
+                )
+            else:
+                logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
     # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
     # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`
@@ -637,6 +729,7 @@ def compress_context(
                 agent.session_id or "",
                 boundary_reason="compression",
                 old_session_id=_boundary_parent,
+                platform=getattr(agent, "platform", None) or "cli",
                 conversation_id=getattr(agent, "_gateway_session_key", None),
             )
     except Exception as _ce_err:
@@ -659,14 +752,20 @@ def compress_context(
     except Exception as _me_err:
         logger.debug("memory manager on_session_switch (compression): %s", _me_err)
 
-    # Warn on repeated compressions (quality degrades with each pass)
+    # Warn on repeated compressions (quality degrades with each pass).
+    # Route through _emit_status (like the other compression warnings above)
+    # so the warning reaches the TUI / Telegram / Discord via status_callback,
+    # not just CLI stdout. _emit_status still _vprints for the CLI, and
+    # storing it on _compression_warning lets replay_compression_warning
+    # re-deliver it once a late-bound gateway status_callback is wired (#36908).
     _cc = agent.context_compressor.compression_count
     if _cc >= 2:
-        agent._vprint(
+        _cc_msg = (
             f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "
-            f"accuracy may degrade. Consider /new to start fresh.",
-            force=True,
+            f"accuracy may degrade. Consider /new to start fresh."
         )
+        agent._compression_warning = _cc_msg
+        agent._emit_status(_cc_msg)
 
     # Emit session:compress event so hooks (e.g. MemPalace sync) can ingest
     # the completed old session before its details are lost. In in-place mode
@@ -739,10 +838,11 @@ def try_shrink_image_parts_in_messages(
     Pillow couldn't help (caller should surface the original error).
 
     Strategy: look for ``image_url`` / ``input_image`` parts carrying a
-    ``data:image/...;base64,...`` payload.  For each one whose encoded
-    size exceeds 4 MB (a safe target that slides under Anthropic's 5 MB
-    ceiling with header overhead) or whose longest side exceeds
-    ``max_dimension``, write the base64 to a tempfile, call
+    ``data:image/...;base64,...`` payload, plus Anthropic-native
+    ``{"type": "image", "source": {"type": "base64", ...}}`` blocks.
+    For each one whose encoded size exceeds 4 MB (a safe target that slides
+    under Anthropic's 5 MB ceiling with header overhead) or whose longest side
+    exceeds ``max_dimension``, write the base64 to a tempfile, call
     ``vision_tools._resize_image_for_vision`` to produce a smaller data
     URL, and substitute it in place.
 
@@ -898,6 +998,28 @@ def try_shrink_image_parts_in_messages(
             logger.warning("image-shrink recovery: re-encode failed — %s", exc)
             return None, triggered_by is not None
 
+    def _source_to_data_url(source: Any) -> Optional[str]:
+        if not isinstance(source, dict) or source.get("type") != "base64":
+            return None
+        data = source.get("data")
+        if not isinstance(data, str) or not data:
+            return None
+        media_type = str(source.get("media_type") or "image/jpeg").strip()
+        if not media_type.startswith("image/"):
+            media_type = "image/jpeg"
+        return f"data:{media_type};base64,{data}"
+
+    def _write_data_url_to_source(source: dict, data_url: str) -> None:
+        header, _, data = data_url.partition(",")
+        media_type = "image/jpeg"
+        if header.startswith("data:"):
+            candidate = header[len("data:"):].split(";", 1)[0].strip()
+            if candidate.startswith("image/"):
+                media_type = candidate
+        source["type"] = "base64"
+        source["media_type"] = media_type
+        source["data"] = data
+
     for msg in api_messages:
         if not isinstance(msg, dict):
             continue
@@ -908,6 +1030,16 @@ def try_shrink_image_parts_in_messages(
             if not isinstance(part, dict):
                 continue
             ptype = part.get("type")
+            if ptype == "image":
+                source = part.get("source")
+                url = _source_to_data_url(source)
+                resized, unshrinkable = _shrink_data_url(url or "")
+                if resized and isinstance(source, dict):
+                    _write_data_url_to_source(source, resized)
+                    changed_count += 1
+                elif unshrinkable:
+                    unshrinkable_oversized += 1
+                continue
             if ptype not in {"image_url", "input_image"}:
                 continue
             image_value = part.get("image_url")
